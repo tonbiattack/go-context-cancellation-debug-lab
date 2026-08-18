@@ -13,6 +13,7 @@ type Worker struct {
 	Started  chan struct{}
 	Finished chan struct{}
 	Result   chan error
+	Recorder *Recorder
 }
 
 // NewWorker はテストで観測できるWorkerを作成します。
@@ -22,18 +23,32 @@ func NewWorker(duration time.Duration) *Worker {
 		Started:  make(chan struct{}),
 		Finished: make(chan struct{}),
 		Result:   make(chan error, 1),
+		Recorder: NewRecorder(),
 	}
 }
 
 // Run は重い処理を実行します。
-// この初期実装はctxを受け取るにもかかわらず、キャンセルを確認しません。
+// DBや外部APIの待機に相当する処理とctx.Done()を同じselectで待ちます。
 func (w *Worker) Run(ctx context.Context) error {
+	w.Recorder.Record("worker: goroutine started", ctx)
 	close(w.Started)
 	defer close(w.Finished)
 
-	time.Sleep(w.Duration)
-	w.Result <- nil
-	return nil
+	w.Recorder.Record("worker: simulated DB call started", ctx)
+	timer := time.NewTimer(w.Duration)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		err := ctx.Err()
+		w.Recorder.Record("worker: ctx.Done observed; goroutine exits", ctx)
+		w.Result <- err
+		return err
+	case <-timer.C:
+		w.Recorder.Record("worker: simulated DB call completed", ctx)
+		w.Result <- nil
+		return nil
+	}
 }
 
 // Handler は重い処理を起動するHTTP APIです。
@@ -51,13 +66,18 @@ func NewHandler(worker *Worker) *Handler {
 }
 
 // ServeHTTP はクライアントの切断を待ちます。
-// 不具合は、下位処理にrequest.Context()ではなくcontext.Background()を渡す点です。
+// request.Context()を下位処理へそのまま渡すため、HTTPのキャンセルが連鎖します。
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	requestCtx := r.Context()
+	h.Worker.Recorder.Record("http: handler entered", requestCtx)
+
 	go func() {
-		_ = h.Worker.Run(context.Background())
+		h.Worker.Recorder.Record("worker: launched with request.Context", requestCtx)
+		_ = h.Worker.Run(requestCtx)
 	}()
 
 	<-h.Worker.Started
-	<-r.Context().Done()
-	h.RequestCanceled <- r.Context().Err()
+	<-requestCtx.Done()
+	h.Worker.Recorder.Record("http: request context Done observed", requestCtx)
+	h.RequestCanceled <- requestCtx.Err()
 }

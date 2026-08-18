@@ -9,8 +9,14 @@ import (
 	"time"
 )
 
+func logObservation(t *testing.T, worker *Worker) {
+	t.Helper()
+	t.Logf("\n--- cancellation observation ---\n%s\n-------------------------------", worker.Recorder.Format())
+}
+
 func TestClientCancellationStopsWorker(t *testing.T) {
 	worker := NewWorker(250 * time.Millisecond)
+	t.Cleanup(func() { logObservation(t, worker) })
 	handler := NewHandler(worker)
 
 	clientCtx, cancel := context.WithCancel(context.Background())
@@ -58,6 +64,7 @@ func TestClientCancellationStopsWorker(t *testing.T) {
 
 func TestTimeoutStopsWorker(t *testing.T) {
 	worker := NewWorker(250 * time.Millisecond)
+	t.Cleanup(func() { logObservation(t, worker) })
 	handler := NewHandler(worker)
 
 	clientCtx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
