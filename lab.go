@@ -34,40 +34,64 @@ func (l *EventLog) Events() []string {
 
 // SlowStore はDBや外部APIの待機を模した、Contextを受け取る下位処理です。
 type SlowStore struct {
-	duration   time.Duration
-	started    chan struct{}
-	finished   chan struct{}
-	cancelled  chan struct{}
-	startOnce  sync.Once
-	endOnce    sync.Once
-	cancelOnce sync.Once
+	duration       time.Duration
+	started        chan struct{}
+	finished       chan struct{}
+	cancelled      chan struct{}
+	workerExited   chan struct{}
+	startOnce      sync.Once
+	finishOnce     sync.Once
+	cancelOnce     sync.Once
+	workerExitOnce sync.Once
+	resultMu       sync.Mutex
+	resultErr      error
 }
 
 // NewSlowStore は観測可能な重い処理を作成します。
 func NewSlowStore(duration time.Duration) *SlowStore {
 	return &SlowStore{
-		duration:  duration,
-		started:   make(chan struct{}),
-		finished:  make(chan struct{}),
-		cancelled: make(chan struct{}),
+		duration:     duration,
+		started:      make(chan struct{}),
+		finished:     make(chan struct{}),
+		cancelled:    make(chan struct{}),
+		workerExited: make(chan struct{}),
 	}
 }
 
-// Load はContextの完了または疑似DB待機の完了を待ちます。
+// Load は別goroutineで疑似DB待機を実行し、Contextの完了または通常完了を返します。
 func (s *SlowStore) Load(ctx context.Context, events *EventLog) error {
 	s.startOnce.Do(func() { close(s.started) })
 	events.Add("store: start ctx_err=%v", ctx.Err())
 
-	select {
-	case <-ctx.Done():
-		s.cancelOnce.Do(func() { close(s.cancelled) })
-		events.Add("store: ctx.Done ctx_err=%v", ctx.Err())
-		return ctx.Err()
-	case <-time.After(s.duration):
-		s.endOnce.Do(func() { close(s.finished) })
-		events.Add("store: completed ctx_err=%v", ctx.Err())
-		return nil
-	}
+	result := make(chan error, 1)
+	go func() {
+		defer s.workerExitOnce.Do(func() { close(s.workerExited) })
+
+		timer := time.NewTimer(s.duration)
+		defer timer.Stop()
+
+		select {
+		case <-ctx.Done():
+			err := ctx.Err()
+			s.cancelOnce.Do(func() { close(s.cancelled) })
+			s.setResult(err)
+			events.Add("store: ctx.Done ctx_err=%v", err)
+			result <- err
+		case <-timer.C:
+			s.finishOnce.Do(func() { close(s.finished) })
+			s.setResult(nil)
+			events.Add("store: completed ctx_err=%v", ctx.Err())
+			result <- nil
+		}
+	}()
+
+	return <-result
+}
+
+func (s *SlowStore) setResult(err error) {
+	s.resultMu.Lock()
+	s.resultErr = err
+	s.resultMu.Unlock()
 }
 
 // Started は下位処理が開始したことを知らせます。
@@ -79,24 +103,41 @@ func (s *SlowStore) Finished() <-chan struct{} { return s.finished }
 // Cancelled は下位処理がctx.Doneを受け取ったことを知らせます。
 func (s *SlowStore) Cancelled() <-chan struct{} { return s.cancelled }
 
+// WorkerExited は下位処理goroutineが終了したことを知らせます。
+func (s *SlowStore) WorkerExited() <-chan struct{} { return s.workerExited }
+
+// ResultErr は下位処理が最後に返したエラーを返します。
+func (s *SlowStore) ResultErr() error {
+	s.resultMu.Lock()
+	defer s.resultMu.Unlock()
+	return s.resultErr
+}
+
 // API はHTTPハンドラと下位処理を束ねます。
 type API struct {
 	store             *SlowStore
 	events            *EventLog
+	workTimeout       time.Duration
 	requestCancelled  chan struct{}
 	requestCancelOnce sync.Once
 }
 
-// NewAPI は不具合を含むAPIを作成します。
+// NewAPI は要求のContextをそのまま下位へ渡すAPIを作成します。
 func NewAPI(store *SlowStore, events *EventLog) *API {
+	return NewAPIWithTimeout(store, events, 0)
+}
+
+// NewAPIWithTimeout は要求の子Contextへ処理時間上限を設定するAPIを作成します。
+func NewAPIWithTimeout(store *SlowStore, events *EventLog, workTimeout time.Duration) *API {
 	return &API{
 		store:            store,
 		events:           events,
+		workTimeout:      workTimeout,
 		requestCancelled: make(chan struct{}),
 	}
 }
 
-// ServeHTTP は意図的にrequest.Contextを下位へ渡さない不具合を含みます。
+// ServeHTTP はrequest.Contextを下位処理まで伝播します。
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestCtx := r.Context()
 	a.events.Add("handler: start request_ctx_err=%v", requestCtx.Err())
@@ -107,10 +148,22 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.events.Add("handler: request ctx.Done request_ctx_err=%v", requestCtx.Err())
 	}()
 
-	// 不具合: 要求由来のContextを捨てるため、クライアントの中断や期限切れが下位へ届かない。
-	err := a.store.Load(context.Background(), a.events)
-	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		http.Error(w, "store failed", http.StatusInternalServerError)
+	workCtx := requestCtx
+	cancel := func() {}
+	if a.workTimeout > 0 {
+		workCtx, cancel = context.WithTimeout(requestCtx, a.workTimeout)
+	}
+	defer cancel()
+
+	if err := a.store.Load(workCtx, a.events); err != nil {
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			http.Error(w, "processing timeout", http.StatusGatewayTimeout)
+		case errors.Is(err, context.Canceled):
+			// クライアントはすでに応答を待っていないため、書き込みを試みません。
+		default:
+			http.Error(w, "store failed", http.StatusInternalServerError)
+		}
 		return
 	}
 
